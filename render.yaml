@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: m3u8-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn m3u8_bot:app & python m3u8_bot.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: 5000
+    healthCheckPath: /health
