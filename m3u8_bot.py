@@ -31,7 +31,11 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 _saved_path = sys.path.copy()
 sys.path = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(_script_dir)]
 
-import m3u8 as m3u8_lib  # Real library from site-packages
+try:
+    import m3u8 as m3u8_lib  # Real library from site-packages
+except ImportError:
+    print("ERROR: m3u8 library not installed. Run: pip install m3u8")
+    sys.exit(1)
 
 sys.path = _saved_path  # Restore path
 # ============================================
@@ -52,11 +56,24 @@ nest_asyncio.apply()
 # CONFIGURATION - Environment Variables for Render
 # ============================================
 # Get from environment variables (set in Render dashboard)
-API_ID = int(os.environ.get("API_ID", "YOUR_API_ID"))
-API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+API_ID = int(os.environ.get("API_ID", "0"))  # Default to 0 to catch missing
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 5000))  # Render assigns port via environment
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+
+# Check required environment variables
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN environment variable not set!")
+    sys.exit(1)
+
+if not API_ID or API_ID == 0:
+    print("ERROR: API_ID environment variable not set or invalid!")
+    sys.exit(1)
+
+if not API_HASH:
+    print("ERROR: API_HASH environment variable not set!")
+    sys.exit(1)
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -116,8 +133,8 @@ LANG_FLAGS = {
 # ============================================
 # FLASK WEB SERVER FOR RENDER HEALTH CHECKS
 # ============================================
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+flask_app = Flask(__name__)
+CORS(flask_app)  # Enable CORS for all routes
 
 # Bot status tracking
 bot_start_time = time.time()
@@ -133,7 +150,7 @@ bot_status = {
     'memory_usage': 0
 }
 
-@app.route('/')
+@flask_app.route('/')
 def home():
     """Root endpoint - shows bot is running"""
     return jsonify({
@@ -143,7 +160,7 @@ def home():
         'message': 'Bot is running!'
     })
 
-@app.route('/health')
+@flask_app.route('/health')
 def health():
     """Health check endpoint for Render"""
     uptime = time.time() - bot_start_time
@@ -156,21 +173,24 @@ def health():
         'queue_size': bot_status['queue_size']
     })
 
-@app.route('/status')
+@flask_app.route('/status')
 def status():
     """Detailed status endpoint"""
     global bot_status
     bot_status['uptime'] = time.time() - bot_start_time
     
-    # Get system info
-    import psutil
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    bot_status['memory_usage'] = memory_info.rss / 1024 / 1024  # MB
+    # Get system info if psutil is available
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        bot_status['memory_usage'] = memory_info.rss / 1024 / 1024  # MB
+    except ImportError:
+        bot_status['memory_usage'] = 0
     
     return jsonify(bot_status)
 
-@app.route('/stats')
+@flask_app.route('/stats')
 def stats():
     """Statistics endpoint"""
     return jsonify({
@@ -184,7 +204,7 @@ def stats():
 def run_flask():
     """Run Flask server in a separate thread"""
     logger.info(f"Starting Flask server on port {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ============================================
 # UTILITY FUNCTIONS
@@ -460,7 +480,7 @@ def extract_urls(text):
     urls = []
     for part in text.replace('\n', ' ').split():
         part = part.strip()
-        if part.startswith('http') and part not in urls:
+        if part.startswith(('http://', 'https://')) and part not in urls:
             urls.append(part)
     return urls
 
@@ -623,10 +643,13 @@ class Downloader:
         os.makedirs(self.vdir, exist_ok=True)
         
         self.adir = os.path.join(self.tmp, "a")
+        if self.audio_url:
+            os.makedirs(self.adir, exist_ok=True)
         
         # Output file
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.out = os.path.join(DOWNLOAD_FOLDER, f"{vname}_{qname}_{ts}.mp4")
+        safe_vname = "".join(c for c in vname if c.isalnum() or c in ' -_').strip()
+        self.out = os.path.join(DOWNLOAD_FOLDER, f"{safe_vname}_{qname}_{ts}.mp4")
 
     def _parse_pl(self, url, sd):
         """Parse playlist and get segments"""
@@ -665,8 +688,7 @@ class Downloader:
             # Parse audio playlist if available
             aus = []
             ahi = False
-            if self.audio_url:
-                os.makedirs(self.adir, exist_ok=True)
+            if self.audio_url and os.path.exists(self.adir):
                 try:
                     aus, ahi = self._parse_pl(self.audio_url, self.adir)
                     logger.info(f"Audio: {len(aus)} segments, init: {ahi}")
@@ -759,7 +781,10 @@ class Downloader:
         if failed:
             logger.warning(f"Retrying {len(failed)} failed segments")
             for i in failed:
-                dl1((i, segs[i]))
+                try:
+                    dl1((i, segs[i]))
+                except:
+                    pass
 
     def _concat(self, sd, n, hi, op):
         """Concatenate segments"""
@@ -789,7 +814,7 @@ class Downloader:
         
         # Concatenate audio if available
         ac = None
-        if aus:
+        if aus and os.path.exists(self.adir):
             await self.cb(f"🔗 **Merging Audio [{self.qname}]...**")
             ac = os.path.join(self.tmp, "ac.mp4")
             self._concat(self.adir, len(aus), ahi, ac)
@@ -830,7 +855,8 @@ class Downloader:
                 shutil.copy(vc, self.out)
         
         # Cleanup temp
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if os.path.exists(self.tmp):
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
 # ============================================
 # TELEGRAM COMMAND HANDLERS
@@ -932,14 +958,26 @@ async def m3u8_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /m3u8 command"""
     cid = update.effective_chat.id
     full = update.message.text
-    after = full.split(None, 1)[1] if len(full.split(None, 1)) > 1 else ''
-    urls = extract_urls(after)
-
-    if not urls:
+    
+    # Extract URLs from command
+    parts = full.split()
+    if len(parts) < 2:
         await update.message.reply_text(
             "❌ **No URLs!**\n\n"
             "**Single:** `/m3u8 <url>`\n"
             "**Multi:** `/m3u8 url1 url2 url3`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    urls = []
+    for part in parts[1:]:
+        if part.startswith(('http://', 'https://')):
+            urls.append(part)
+    
+    if not urls:
+        await update.message.reply_text(
+            "❌ **No valid URLs found!**",
             parse_mode='Markdown'
         )
         return
@@ -1072,9 +1110,13 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ud['is_all'] = True
             ud['sel_h'] = None
         else:
-            qi = int(data.split('_')[1])
-            ud['is_all'] = False
-            ud['sel_h'] = ud['qualities'][qi]['height']
+            try:
+                qi = int(data.split('_')[1])
+                ud['is_all'] = False
+                ud['sel_h'] = ud['qualities'][qi]['height']
+            except (ValueError, IndexError):
+                await q.edit_message_text("❌ **Invalid quality selection**")
+                return
 
         ats = ud.get('audio_tracks', [])
         
@@ -1099,7 +1141,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📺 Video: **{qt}**{un}\n\n"
                 f"👇 Choose language:\n⭐ = Hindi\n\n"
                 f"Available:\n" +
-                "\n".join(f"   • {t['display']} ({t.get('name','')})" for t in ats[:5]),
+                "\n".join(f"   • {t['display']}" for t in ats[:5]),
                 reply_markup=InlineKeyboardMarkup(kb),
                 parse_mode='Markdown'
             )
@@ -1112,19 +1154,22 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _go(cid, ud, q, context)
 
     elif data.startswith("audio_"):
-        ai = int(data.split('_')[1])
-        ats = ud.get('audio_tracks', [])
-        
-        if ai >= len(ats):
-            await q.edit_message_text("❌ **Invalid**")
-            return
-        
-        sa = ats[ai]
-        ud['sel_al'] = sa.get('language', '')
-        ud['sel_an'] = sa.get('name', '')
-        logger.info(f"Selected audio: {sa['display']}")
-        
-        await _go(cid, ud, q, context)
+        try:
+            ai = int(data.split('_')[1])
+            ats = ud.get('audio_tracks', [])
+            
+            if ai >= len(ats):
+                await q.edit_message_text("❌ **Invalid**")
+                return
+            
+            sa = ats[ai]
+            ud['sel_al'] = sa.get('language', '')
+            ud['sel_an'] = sa.get('name', '')
+            logger.info(f"Selected audio: {sa['display']}")
+            
+            await _go(cid, ud, q, context)
+        except (ValueError, IndexError):
+            await q.edit_message_text("❌ **Invalid audio selection**")
 
 async def _go(cid, ud, query, context):
     """Proceed with download after selections"""
@@ -1589,26 +1634,26 @@ async def main():
     bot_status['status'] = 'running'
 
     # Setup Telegram bot
-    app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
     
     # Add command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("m3u8", m3u8_cmd))
-    app.add_handler(CommandHandler("allcancel", allcancel_cmd))
-    app.add_handler(CallbackQueryHandler(cb_handler))
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("status", status_cmd))
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
+    telegram_app.add_handler(CommandHandler("m3u8", m3u8_cmd))
+    telegram_app.add_handler(CommandHandler("allcancel", allcancel_cmd))
+    telegram_app.add_handler(CallbackQueryHandler(cb_handler))
 
     logger.info("   ✅ Telegram bot configured")
     logger.info("╔════════════════════════════════════════════╗")
     logger.info("║        🎉  BOT IS RUNNING!  🎉             ║")
     logger.info("╚════════════════════════════════════════════╝")
-    logger.info(f"   📱 Send /start to @{(await app.bot.get_me()).username}")
+    logger.info(f"   📱 Send /start to @{(await telegram_app.bot.get_me()).username}")
     logger.info(f"   🌐 Health check: http://localhost:{PORT}/health")
     logger.info(f"   🛑 Ctrl+C to stop\n")
 
     # Run bot with polling
-    await app.run_polling(drop_pending_updates=True)
+    await telegram_app.run_polling(drop_pending_updates=True)
 
 # ============================================
 # ENTRY POINT
